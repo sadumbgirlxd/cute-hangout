@@ -68,6 +68,7 @@
   .empty{text-align:center;color:var(--muted);padding:44px 20px;font-size:15px;line-height:1.7;}
   .empty .big{font-size:44px;display:block;margin-bottom:8px;}
   .more{align-self:center;}
+  img.lazy-img:not([src]){min-height:140px;width:100%;background:var(--card2);border-radius:12px;display:block;}
   /* people / conversations */
   .person-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--line);}
   .person-row:last-child{border-bottom:0;}
@@ -210,7 +211,6 @@
   loadScript(BASE+'firebase-app-compat.js')
     .then(function(){return loadScript(BASE+'firebase-auth-compat.js');})
     .then(function(){return loadScript(BASE+'firebase-database-compat.js');})
-    .then(function(){return loadScript(BASE+'firebase-storage-compat.js');})
     .then(start)
     .catch(function(e){document.querySelector('main').innerHTML='<div class="card empty"><span class="big">😿</span>Could not load Firebase.<br>'+e.message+'</div>';});
 
@@ -228,11 +228,10 @@
     firebase.initializeApp(firebaseConfig);
     var auth = firebase.auth();
     var db = firebase.database();
-    var storage = firebase.storage();
     var TS = firebase.database.ServerValue.TIMESTAMP;
     var $ = function(id){return document.getElementById(id);};
 
-    var MAX_BYTES=5*1024*1024;
+    var IMG_LIMIT=120000, AVATAR_LIMIT=9000;   // base64 chars; keeps Spark bandwidth low
     var PAGE_SIZE=50;
     var uid=null;
     var state={profile:loadProfile(),posts:[]};
@@ -241,7 +240,7 @@
     var convos={};        // uid -> true
     var pendingImage=null;   // {blob, url, preview}
     var pendingAvatar=null;  // {blob, url, preview}
-    var chatPerson=null, chatUnsub=null, chatImageBlob=null;
+    var chatPerson=null, chatUnsub=null, chatImageData=null;
     var currentRoute={page:'feed'};
     var postLimit=PAGE_SIZE, postsRef=null, postsHandler=null;
     var busy={post:false,chat:false,profile:false};
@@ -272,34 +271,68 @@
     function convoId(a,b){return[a,b].sort().join('__');}
     function lookup(id,fallback){return people[id]||fallback||{name:'Unknown unicorn'};}
 
-    /* ---------- Images: resize + upload to Firebase Storage ---------- */
-    function processImage(file,maxDim){
+    /* ---------- Images: compressed, stored in Realtime Database (Spark-friendly, no Storage) ---------- */
+    function readAsDataURL(file){
+      return new Promise(function(res,rej){var r=new FileReader();r.onload=function(){res(r.result);};r.onerror=function(){rej(new Error('Could not read file'));};r.readAsDataURL(file);});
+    }
+    function compressImage(file,maxDim,limit){
       return new Promise(function(res,rej){
         if(!file){rej(new Error('No image selected'));return;}
         if(!/^image\//.test(file.type)){rej(new Error('That file is not an image'));return;}
-        if(file.type==='image/gif'){
-          if(file.size>MAX_BYTES){rej(new Error('GIF is over 5 MB'));return;}
-          res(file);return;
-        }
-        var url=URL.createObjectURL(file),img=new Image();
-        img.onload=function(){
-          var scale=Math.min(1,maxDim/Math.max(img.width,img.height));
-          var c=document.createElement('canvas');
-          c.width=Math.max(1,Math.round(img.width*scale));c.height=Math.max(1,Math.round(img.height*scale));
-          c.getContext('2d').drawImage(img,0,0,c.width,c.height);
-          URL.revokeObjectURL(url);
-          c.toBlob(function(b){b?res(b):rej(new Error('Could not process image'));},'image/jpeg',0.82);
-        };
-        img.onerror=function(){URL.revokeObjectURL(url);rej(new Error('Could not read that image'));};
-        img.src=url;
+        var gifFirst=file.type==='image/gif'&&limit>=IMG_LIMIT
+          ?readAsDataURL(file).then(function(d){return d.length<=limit?d:null;}):Promise.resolve(null);
+        gifFirst.then(function(raw){
+          if(raw){res(raw);return;}
+          if(file.type==='image/gif')toast('GIF too big to keep animated, saved as a still. Paste a GIF link to keep it moving.');
+          var url=URL.createObjectURL(file),img=new Image();
+          img.onload=function(){
+            URL.revokeObjectURL(url);
+            var dim=maxDim,q=0.78;
+            for(var i=0;i<14;i++){
+              var scale=Math.min(1,dim/Math.max(img.width,img.height));
+              var c=document.createElement('canvas');
+              c.width=Math.max(1,Math.round(img.width*scale));c.height=Math.max(1,Math.round(img.height*scale));
+              var ctx=c.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);ctx.drawImage(img,0,0,c.width,c.height);
+              var d=c.toDataURL('image/jpeg',q);
+              if(d.length<=limit){res(d);return;}
+              if(q>0.5)q-=0.1;else dim=Math.round(dim*0.8);
+            }
+            rej(new Error('Could not shrink that image enough'));
+          };
+          img.onerror=function(){URL.revokeObjectURL(url);rej(new Error('Could not read that image'));};
+          img.src=url;
+        }).catch(rej);
       });
     }
-    function uploadBlob(blob,path){
-      var ref=storage.ref(path);
-      return ref.put(blob,{contentType:blob.type||'image/jpeg'}).then(function(snap){return snap.ref.getDownloadURL();}).then(function(url){return{url:url,path:path};});
+    // Images live in their own node so the posts/messages listeners never download image bytes.
+    function saveImage(dataUrl){
+      var id=db.ref('images').push().key;
+      return db.ref('images/'+id).set({owner:uid,data:dataUrl,ts:TS}).then(function(){return id;});
     }
-    function randId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
-    function extFor(blob){return blob.type==='image/gif'?'gif':'jpg';}
+    var imgCache={},imgInflight={};
+    function imgTag(cls,id,url,alt){
+      if(id)return'<img class="'+cls+' lazy-img" data-img-id="'+esc(id)+'" alt=""'+(imgCache[id]?' src="'+esc(imgCache[id])+'"':'')+'>';
+      if(url)return'<img class="'+cls+'" loading="lazy" src="'+esc(url)+'" alt="'+esc(alt)+'">';
+      return'';
+    }
+    function hydrateImages(root){
+      (root||document).querySelectorAll('img[data-img-id]:not([src])').forEach(function(el){
+        var id=el.dataset.imgId;
+        if(imgCache[id]){el.src=imgCache[id];return;}
+        if(!imgInflight[id]){
+          imgInflight[id]=db.ref('images/'+id+'/data').once('value').then(function(s){
+            var v=s.val();if(v&&/^data:image\//.test(v))imgCache[id]=v;
+          }).catch(function(){}).then(function(){delete imgInflight[id];});
+        }
+        imgInflight[id].then(function(){
+          if(!imgCache[id])return;
+          document.querySelectorAll('img[data-img-id="'+id+'"]').forEach(function(e){
+            e.onload=function(){var cm=$('chatMessages');if(cm&&cm.contains(e))cm.scrollTop=cm.scrollHeight;};
+            e.src=imgCache[id];
+          });
+        });
+      });
+    }
 
     /* ---------- Profile ---------- */
     function renderHeader(){
@@ -327,7 +360,7 @@
     $('avatarEdit').addEventListener('click',function(){$('avatarFile').click();});
     $('avatarFile').addEventListener('change',function(e){
       var f=e.target.files[0];e.target.value='';
-      processImage(f,256).then(function(b){pendingAvatar={blob:b,preview:URL.createObjectURL(b)};renderAvatarEdit();}).catch(function(err){toast(err.message);});
+      compressImage(f,96,AVATAR_LIMIT).then(function(d){pendingAvatar={data:d,preview:d};renderAvatarEdit();}).catch(function(err){toast(err.message);});
     });
     $('saveProfile').addEventListener('click',function(){
       if(!uid){toast('Still signing in… try again in a second');return;}
@@ -335,9 +368,7 @@
       var n=$('nameInput').value.trim();
       if(!n){toast('Please choose a display name');return;}
       busy.profile=true;var btn=$('saveProfile');btn.disabled=true;btn.textContent='Saving…';
-      var avatarP=pendingAvatar&&pendingAvatar.blob
-        ?uploadBlob(pendingAvatar.blob,'users/'+uid+'/avatar.'+extFor(pendingAvatar.blob)).then(function(r){return r.url;})
-        :Promise.resolve(pendingAvatar&&pendingAvatar.url?pendingAvatar.url:null);
+      var avatarP=Promise.resolve(pendingAvatar?(pendingAvatar.data||pendingAvatar.url||null):null);
       avatarP.then(function(avatarUrl){
         var data={name:n,updatedAt:TS};if(avatarUrl)data.avatar=avatarUrl;
         return db.ref('profiles/'+uid).set(data).then(function(){
@@ -362,7 +393,7 @@
     $('previewImg').addEventListener('error',function(){if($('previewImg').getAttribute('src'))toast("Couldn't load that image 🤔");});
     $('fileInput').addEventListener('change',function(e){
       var f=e.target.files[0];e.target.value='';
-      processImage(f,1200).then(function(b){showPreview({blob:b,preview:URL.createObjectURL(b)});}).catch(function(err){toast(err.message);});
+      compressImage(f,1100,IMG_LIMIT).then(function(d){showPreview({data:d,preview:d});}).catch(function(err){toast(err.message);});
     });
     $('postBtn').addEventListener('click',function(){
       if(!uid){toast('Still signing in… try again in a second');return;}
@@ -371,10 +402,10 @@
       if(!pendingImage&&!caption){toast('Add an image or a caption first 🦄');return;}
       busy.post=true;var btn=$('postBtn');btn.disabled=true;btn.textContent='Posting…';
       var img=pendingImage;
-      var up=img&&img.blob?uploadBlob(img.blob,'users/'+uid+'/posts/'+randId()+'.'+extFor(img.blob)):Promise.resolve(img&&img.url?{url:img.url,path:null}:null);
+      var up=img&&img.data?saveImage(img.data).then(function(id){return{id:id};}):Promise.resolve(img&&img.url?{url:img.url}:null);
       up.then(function(r){
         var post={authorId:uid,caption:caption,ts:TS};
-        if(r){post.image=r.url;if(r.path)post.imagePath=r.path;}
+        if(r){if(r.id)post.imageId=r.id;else post.image=r.url;}
         return db.ref('posts').push(post);
       }).then(function(){clearPreview();$('captionInput').value='';toast('Posted! 🦄');})
         .catch(function(e){toast('Post failed: '+e.message);})
@@ -389,7 +420,7 @@
         var lc=Object.keys(likes).filter(function(k){return likes[k]===true;}).length;
         var rc=Object.keys(reports).filter(function(k){return reports[k]===true;}).length;
         var cs=Object.keys(comments).map(function(k){return Object.assign({id:k},comments[k]);}).sort(function(a,b){return Number(a.ts||0)-Number(b.ts||0);});
-        arr.push({id:id,authorId:p.authorId||null,legacyAuthor:p.author||null,caption:p.caption||'',image:p.image||null,imagePath:p.imagePath||null,ts:p.ts||Date.now(),
+        arr.push({id:id,authorId:p.authorId||null,legacyAuthor:p.author||null,caption:p.caption||'',image:p.image||null,imageId:p.imageId||null,ts:p.ts||Date.now(),
           likes:{count:lc,liked:likes[uid]===true},comments:cs,reports:{count:rc,reported:reports[uid]===true}});
       });
       arr.sort(function(a,b){return Number(b.ts||0)-Number(a.ts||0);});
@@ -408,7 +439,7 @@
       }).join('');
       return'<article class="card post" data-id="'+esc(p.id)+'" style="margin-bottom:16px"><div class="post-head">'+avatarHTML(author)+'<div><div class="post-author">'+esc(author.name)+'</div><div class="post-time">'+timeSpan(p.ts)+'</div></div>'+
         (isMe?'<div class="spacer"></div><button class="action-btn" data-action="delete" title="Delete post">🗑️</button>':'')+'</div>'+
-        (p.caption?'<p class="post-caption">'+esc(p.caption)+'</p>':'')+(p.image?'<img class="post-img" loading="lazy" src="'+esc(p.image)+'" alt="post image">':'')+
+        (p.caption?'<p class="post-caption">'+esc(p.caption)+'</p>':'')+imgTag('post-img',p.imageId,p.image,'post image')+
         '<div class="actions"><button class="action-btn'+(p.likes.liked?' liked':'')+'" data-action="like">❤️ <span>'+p.likes.count+'</span></button><button class="action-btn" data-action="focusComment">💬 <span>'+p.comments.length+'</span></button><button class="action-btn'+(p.reports.reported?' reported':'')+'" data-action="report">'+(p.reports.reported?'🚩 Reported':'🚩 Report')+'</button></div>'+
         '<div class="comments">'+ch+'</div><form class="comment-form"><input type="text" placeholder="Add a comment..." maxlength="300"><button class="btn btn-primary btn-sm" type="submit">Send</button></form></article>';
     }
@@ -420,7 +451,7 @@
         if(i&&i.value)drafts[po.dataset.id]=i.value;
         if(i&&document.activeElement===i)focusId=po.dataset.id;
       });
-      box.innerHTML=html;
+      box.innerHTML=html;hydrateImages(box);
       box.querySelectorAll('.post').forEach(function(po){
         var i=po.querySelector('.comment-form input');if(!i)return;
         if(drafts[po.dataset.id])i.value=drafts[po.dataset.id];
@@ -452,7 +483,7 @@
         if(!confirm('Delete this post?'))return;
         var p=state.posts.filter(function(x){return x.id===id;})[0];
         db.ref('posts/'+id).remove().then(function(){
-          if(p&&p.imagePath)storage.ref(p.imagePath).delete().catch(function(){});
+          if(p&&p.imageId)db.ref('images/'+p.imageId).remove().catch(function(){});
         }).catch(function(err){toast('Delete failed: '+err.message);});
       }
     }
@@ -526,7 +557,7 @@
     function closeChat(){if(chatUnsub){chatUnsub();chatUnsub=null;}chatPerson=null;}
     function resetChatForm(){
       $('chatText').value='';$('chatGif').value='';$('chatGif').classList.remove('show');
-      chatImageBlob=null;$('chatPending').classList.remove('show');$('chatPending').textContent='';
+      chatImageData=null;$('chatPending').classList.remove('show');$('chatPending').textContent='';
     }
     function openChat(id){
       closeChat();resetChatForm();
@@ -540,9 +571,9 @@
         var box=$('chatMessages');
         box.innerHTML=msgs.length?msgs.map(function(m){
           var mine=m.sender===uid;
-          return'<div class="bubble'+(mine?' mine':'')+'">'+esc(m.text||'')+(m.media?'<img src="'+esc(m.media)+'" alt="attachment">':'')+'<div class="meta">'+timeSpan(m.ts)+'</div></div>';
+          return'<div class="bubble'+(mine?' mine':'')+'">'+esc(m.text||'')+imgTag('',m.mediaId,m.media,'attachment')+'<div class="meta">'+timeSpan(m.ts)+'</div></div>';
         }).join(''):'<div class="hint" style="text-align:center;margin:auto">Say hi to '+esc(person.name)+' 👋</div>';
-        box.scrollTop=box.scrollHeight;
+        hydrateImages(box);box.scrollTop=box.scrollHeight;
       };
       ref.on('value',handler,function(err){toast('Could not load messages: '+err.message);});
       chatUnsub=function(){ref.off('value',handler);};
@@ -550,7 +581,7 @@
     $('gifToggle').addEventListener('click',function(){$('chatGif').classList.toggle('show');if($('chatGif').classList.contains('show'))$('chatGif').focus();});
     $('chatImage').addEventListener('change',function(e){
       var f=e.target.files[0];e.target.value='';
-      processImage(f,1000).then(function(b){chatImageBlob=b;$('chatPending').textContent='📷 Image attached — press Send';$('chatPending').classList.add('show');}).catch(function(err){toast(err.message);});
+      compressImage(f,900,IMG_LIMIT).then(function(d){chatImageData=d;$('chatPending').textContent='📷 Image attached — press Send';$('chatPending').classList.add('show');}).catch(function(err){toast(err.message);});
     });
     $('chatForm').addEventListener('submit',function(e){
       e.preventDefault();
@@ -559,14 +590,14 @@
       var text=$('chatText').value.trim();
       var gif=$('chatGif').value.trim();
       var gifUrl=/^https?:\/\//i.test(gif)&&gif.length<=1000?gif:null;
-      if(!text&&!chatImageBlob&&!gifUrl){toast('Write something or attach an image');return;}
-      var other=chatPerson.id,blob=chatImageBlob;
+      if(!text&&!chatImageData&&!gifUrl){toast('Write something or attach an image');return;}
+      var other=chatPerson.id,imgData=chatImageData;
       busy.chat=true;var btn=$('chatSend');btn.disabled=true;
-      var up=blob?uploadBlob(blob,'users/'+uid+'/chat/'+randId()+'.'+extFor(blob)).then(function(r){return r.url;}):Promise.resolve(gifUrl);
-      up.then(function(media){
+      var up=imgData?saveImage(imgData).then(function(id){return{id:id};}):Promise.resolve(gifUrl?{url:gifUrl}:null);
+      up.then(function(m){
         var msg={sender:uid,ts:TS};
         if(text)msg.text=text;
-        if(media)msg.media=media;
+        if(m){if(m.id)msg.mediaId=m.id;else msg.media=m.url;}
         return db.ref('messages/'+convoId(uid,other)).push(msg);
       }).then(function(){
         resetChatForm();
